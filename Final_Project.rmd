@@ -1,0 +1,485 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  fig.path = "figures/",  # All plots will be saved to the "figures/" directory
+  dev = "png",            # Default device
+  fig.width = 6,
+  fig.height = 4
+)
+```
+
+## PUBH 3242: Health Data Visualization - Tim Neumann
+# Understanding COVID-19 case and mortality data Germany (2020-2023)
+
+```{r message=FALSE, warning=FALSE}
+# Importing libraries 
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(gganimate)
+library(prophet)
+library(rstan)
+library(ggridges)
+library(scales)
+```
+
+**Data Processing and Cleaning**
+
+```{r message=FALSE, warning=FALSE}
+# Data Retrieval and Cleaning
+
+df_cases = read_csv("data/time_series_covid19_confirmed_global.csv") %>% 
+      dplyr::select(-c("Province/State","Lat","Long")) %>% 
+      dplyr::rename(country = "Country/Region")
+
+df_deaths = read_csv("data/time_series_covid19_deaths_global.csv") %>% 
+      dplyr::select(-c("Province/State","Lat","Long")) %>% 
+      dplyr::rename(country = "Country/Region")
+
+data_cases = df_cases %>% filter(country == "Germany") %>% dplyr::select(-c(country)) %>%
+    pivot_longer(
+      everything(),
+      names_to = "date",
+      values_to = "cases"
+    )
+
+data_deaths = df_deaths %>% filter(country == "Germany") %>% dplyr::select(-c(country)) %>%
+    pivot_longer(
+      everything(),
+      names_to = "date",
+      values_to = "cases"
+    )
+
+data_cases$date = as.Date(data_cases$date, "%m/%d/%y")
+data_deaths$date = as.Date(data_deaths$date, "%m/%d/%y")
+
+germany_covid = merge(data_cases, data_deaths, by = "date", all = TRUE)
+
+names(germany_covid) = c("date", "cases", "deaths")
+
+# calculating daily cases and deaths
+temp = germany_covid$cases[1]
+for (x in 2:nrow(germany_covid)) {
+    temp2 = germany_covid$cases[x] 
+    germany_covid$cases[x] = temp2-temp
+    temp = temp2
+}
+
+temp = germany_covid$deaths[1]
+for (x in 2:nrow(germany_covid)) {
+    temp2 = germany_covid$deaths[x] 
+    germany_covid$deaths[x] = temp2-temp
+    temp = temp2
+}
+
+index = which(germany_covid$cases!=0)[1]
+first_day = germany_covid$date[index]
+germany_covid$days_rel_start = julian(germany_covid$date,as.Date(first_day,"%m-%d-%y")) # start date of pandemic
+
+# accounting for case outliers and missing reports
+germany_covid = germany_covid %>%  mutate (cases = ifelse(is.na(cases)|cases<0, 0, cases),
+                                           deaths = ifelse(is.na(deaths)|deaths<0, 0, deaths))
+
+# germany_covid[germany_covid$cases ==0,] # -> on weekends, there were no reported cases added
+no_reports_cases = which(germany_covid$cases == 0)
+
+# germany_covid[germany_covid$deaths ==0,] # -> on weekends, there were no reported deaths added
+no_reports_deaths = which(germany_covid$deaths == 0)
+```
+
+```{r message=FALSE, warning=FALSE}
+germany_covid$wday = wday(germany_covid$date)
+germany_covid$wday = factor(germany_covid$wday, levels = c(2,3,4,5,6,7,1), labels = c("Monday", "Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"))
+                               
+ggplot(germany_covid, aes(x = cases, y = wday)) +
+  geom_density_ridges_gradient(scale = 3) + xlim(0, 1500) +
+  labs(x = "Number of cases (truncated)", y = "Weekday", title = "COVID-19 cases per weekday in Germany 2020-2023") + theme_bw() +   
+  theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = 
+          element_text(size = 10, hjust = 0.5)) 
+```
+
+```{r message=FALSE, warning=FALSE}
+for (index in no_reports_cases) {
+  if (index >= 4 && index <= (nrow(germany_covid) - 3)) {
+    avg_cases = mean(c(germany_covid$cases[(index - 3):(index - 1)], germany_covid$cases[(index + 1):(index + 3)]))
+    germany_covid$cases[index] = as.integer(avg_cases)
+  }
+}
+
+for (index in no_reports_deaths) {
+  if (index >= 4 && index <= (nrow(germany_covid) - 3)) {
+    avg_deaths = mean(c(germany_covid$deaths[(index - 3):(index - 1)], germany_covid$deaths[(index + 1):(index + 3)]))
+    germany_covid$deaths[index] = as.integer(avg_deaths)
+  }
+}
+
+# create some more variables
+germany_covid$day = day(germany_covid$date)
+germany_covid$month = month(germany_covid$date)
+germany_covid$year = year(germany_covid$date)
+```
+
+**Research Question 1: General patterns and public policy**
+
+```{r message=FALSE, warning=FALSE}
+
+# determine cases and deaths per 1,000,000
+
+population = 81000000 
+germany_covid$case_rate = 100000*germany_covid$cases/population
+germany_covid$death_rate = 100000*germany_covid$deaths/population
+
+
+germany_covid %>% ggplot(aes(x = date, y = case_rate)) + geom_point() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + labs(x = "Date", y = "Rate of case number per 100,000", title = "COVID-19 case rate over time in Germany 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) + scale_y_continuous(labels = comma)
+
+germany_covid %>% ggplot(aes(x = date, y = death_rate)) + geom_point() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + labs(x = "Date", y = "Rate of case number per 100,000", title = "COVID-19 death rate over time in Germany 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) + scale_y_continuous(labels = comma)
+```
+
+```{r message=FALSE, warning=FALSE}
+
+## The case rate is considered to be:
+#     Low (0-9.99); 
+#     Moderate (10.00-49.99); 
+#     Substantial (50.00-99.99); and 
+#     High (greater than or equal to 100.00)
+
+## Produce visualization to show these thresholds by color
+
+germany_covid$crit_cases = cut(germany_covid$case_rate, c(-1,10,50,100,5000), 
+                labels = c("Low","Moderate","Substantial","High"))
+
+threshold = data.frame(th = c(10,50,100),level = c("1st","2nd","3rd"))
+
+ggplot(germany_covid, aes(x = date,
+           y = case_rate))+
+  geom_point(aes(color = crit_cases))+
+  geom_line(color = "grey")+
+  geom_hline(data = threshold,aes(yintercept = th,
+                                  color = level), lty=2,
+             show.legend = FALSE)+
+  labs(x = "  ", y = "Case rate per 100,000", title = "COVID-19 case rate in Germany over time", subtitle = "Colored by thresholds of severity", color = "Thresholds")+
+  scale_color_manual(values = c("Low" = "green",
+                                "Moderate" = "yellow",
+                                "Substantial" = "orange",
+                                "High" = "red"))+
+  theme_light()+
+  theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5))
+```
+
+```{r message=FALSE, warning=FALSE}
+
+## The death rate is considered to be:
+#     Low [0-0.1); 
+#     Moderate (0.1 - 0.25); 
+#     Substantial (0.25-0.375); and 
+#     High (greater than or equal to 0.375)
+
+## Produce visualization to show these thresholds by color
+
+germany_covid$crit_deaths = cut(germany_covid$death_rate, c(-1,0.1,0.25,0.375,2), 
+                labels = c("Low","Moderate","Substantial","High"))
+
+threshold = data.frame(th = c(0.1,0.25,0.375),level = c("1st","2nd","3rd"))
+
+ggplot(germany_covid, aes(x = date,
+           y = death_rate))+
+  geom_point(aes(color = crit_deaths))+
+  geom_line(color = "grey")+
+  geom_hline(data = threshold,aes(yintercept = th,
+                                  color = level), lty=2,
+             show.legend = FALSE)+
+  labs(x = "  ", y = "Death rate per 100,000", title = "COVID-19 death rate in Germany over time", subtitle = "Colored by thresholds of severity", color = "Thresholds")+
+  scale_color_manual(values = c("Low" = "green",
+                                "Moderate" = "yellow",
+                                "Substantial" = "orange",
+                                "High" = "red"))+
+  theme_light()+
+  theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5))
+```
+
+```{r message=FALSE, warning=FALSE}
+germany_covid$month2 = factor(germany_covid$month, levels = c(1,2,3,4,5,6,7,8,9,10,11,12), labels = c("January", "February","March","April","May","June","July","August","September","October","November","December"))
+
+ggplot(germany_covid, aes(x = cases, y = as.factor(month2))) +
+  geom_density_ridges(scale = 3) + scale_x_continuous(labels = comma) + xlim(0, 50000) +labs(x = "Number of cases (truncated)", y = "Month", title = "COVID-19 cases per month in Germany 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5))
+
+ggplot(germany_covid, aes(x = cases, y = as.factor(year))) +
+  geom_density_ridges(scale = 3) + scale_x_continuous(labels = comma) + xlim(0, 250000) + labs(x = "Number of cases (truncated)", y = "Year", title = "COVID-19 cases per year in Germany ") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) 
+
+ggplot(germany_covid, aes(x = deaths, y = as.factor(month2))) +
+  geom_density_ridges(scale = 3) + scale_x_continuous(labels = comma) + xlim(0, 1000) +labs(x = "Number of deaths (truncated)", y = "Month", title = "COVID-19 deaths per month in Germany 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5))
+
+ggplot(germany_covid, aes(x = deaths, y = as.factor(year))) +
+  geom_density_ridges(scale = 3) + scale_x_continuous(labels = comma) + xlim(0, 2000) + labs(x = "Number of deaths (truncated)", y = "Year", title = "COVID-19 deaths per year in Germany ") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) 
+```
+
+```{r message=FALSE, warning=FALSE}
+# lockdown data in Germany: March 22, 2020 - May 4, 2020 (partial lockdown), November 2, 2020 - January 6, 2021 (light lockdown), January 6, 2021 - ~July 2021 (strict lockdown) 
+
+lockdowns = data.frame(
+  start_date = as.Date(c("2020-03-22", "2020-11-02", "2020-12-16","2021-04-23","2021-08-23","2022-03-19", "2022-09-16")),
+  end_date = as.Date(c("2020-05-04", "2020-12-16","2021-04-23","2021-06-30", "2022-03-19", "2022-09-16", "2023-03-01")),
+  lockdown_type = c("Partial Lockdown", "Light Lockdown","Second Lockdown","Bundesnotbremse", "3G","Local Regulations", "Masks and Testing"))
+
+germany_covid %>% ggplot(aes(x = date, y = cases)) + 
+                  geom_point() + 
+                  theme_bw() + 
+                  labs(x = "Date", y = "Case number", 
+                       title = "COVID-19 case data over time in Germany 2020-2023") + 
+                  annotate("rect", xmin = lockdowns$start_date, xmax = lockdowns$end_date, 
+                                    ymin = -Inf, ymax = Inf,fill = c("yellow","orange","purple","red","navy","blue", 
+                                                                     "green"), alpha = 0.3) +
+                  annotate("text", x = as.Date("2020-05-01"), y = 150000, label = "Partial Lockdown", color = "yellow") +
+                  annotate("text", x = as.Date("2020-11-31", "%Y-%m-%d"), y = 200000, label = "Light Lockdown", color = "orange")+                     annotate("text", x = as.Date("2021-02-15"), y = 250000, label = "Second Lockdown", color = "Purple")+        
+                  annotate("text", x = as.Date("2021-05-30"), y = 300000, label = "Bundesnotbremse", color = "red")+                                   annotate("text", x = as.Date("2021-12-10"), y = 350000, label = "3G", color = "navy")+
+                  annotate("text", x = as.Date("2022-06-16"), y = 400000, label = "Local Regulations", color = "blue")+          
+                  annotate("text", x = as.Date("2022-12-01"), y = 450000, label = "Masks and Testing", color = "green")+
+                  theme(axis.text.x = element_text(angle = 90), axis.title = element_text(size = 10, hjust = 0.5), 
+                        plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, 
+                                                                                           hjust = 0.5)) +
+                  scale_y_continuous(labels = comma)
+
+germany_covid %>% ggplot(aes(x = date, y = cases)) + geom_point() + theme_bw() + scale_y_log10(labels = comma) + labs(x = "Date", y = "Case number", title = "COVID-19 case data over time in Germany 2020-2023") + theme(axis.text.x = element_text(angle = 90), axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) + 
+  geom_vline(xintercept = as.Date("2020-03-22", "%Y-%m-%d"), color = "yellow") +
+  geom_vline(xintercept = as.Date("2020-11-02", "%Y-%m-%d"), color = "orange") +
+  geom_vline(xintercept = as.Date("2020-12-16", "%Y-%m-%d"), color = "purple") +
+  geom_vline(xintercept = as.Date("2021-04-23", "%Y-%m-%d"), color = "red") +
+  geom_vline(xintercept = as.Date("2021-08-23", "%Y-%m-%d"), color = "navy") +
+  geom_vline(xintercept = as.Date("2022-03-19", "%Y-%m-%d"), color = "blue") +
+  geom_vline(xintercept = as.Date("2022-00-16", "%Y-%m-%d"), color = "green") 
+```
+
+```{r message=FALSE, warning=FALSE}
+# lockdown data in Germany: March 22, 2020 - May 4, 2020 (partial lockdown), November 2, 2020 - January 6, 2021 (light lockdown), January 6, 2021 - ~July 2021 (strict lockdown) 
+
+lockdowns = data.frame(
+  start_date = as.Date(c("2020-03-22", "2020-11-02", "2020-12-16","2021-04-23","2021-08-23","2022-03-19", "2022-09-16")),
+  end_date = as.Date(c("2020-05-04", "2020-12-16","2021-04-23","2021-06-30", "2022-03-19", "2022-09-16", "2023-03-01")),
+  lockdown_type = c("Partial Lockdown", "Light Lockdown","Second Lockdown","Bundesnotbremse", "3G","Local Regulations", "Masks and Testing"))
+
+germany_covid %>% ggplot(aes(x = date, y = deaths)) + 
+                  geom_point() + 
+                  theme_bw() + 
+                  labs(x = "Date", y = "Death number", 
+                       title = "COVID-19 death data over time in Germany 2020-2023") + 
+                  annotate("rect", xmin = lockdowns$start_date, xmax = lockdowns$end_date, 
+                                    ymin = -Inf, ymax = Inf,fill = c("yellow","orange","purple","red","navy","blue", 
+                                                                     "green"), alpha = 0.3) +
+                  annotate("text", x = as.Date("2020-04-01"), y = 800, label = "Partial Lockdown", color = "yellow") +
+                  annotate("text", x = as.Date("2020-11-31", "%Y-%m-%d"), y = 1000, label = "Light Lockdown", color = "orange")+                     annotate("text", x = as.Date("2021-02-15"), y = 1500, label = "Second Lockdown", color = "Purple")+        
+                  annotate("text", x = as.Date("2021-05-30"), y = 2000, label = "Bundesnotbremse", color = "red")+                                   annotate("text", x = as.Date("2021-12-10"), y = 2200, label = "3G", color = "navy")+
+                  annotate("text", x = as.Date("2022-06-16"), y = 2500, label = "Local Regulations", color = "blue")+          
+                  annotate("text", x = as.Date("2023-01-01"), y = 2700, label = "Masks and Testing", color = "green")+
+                  theme(axis.text.x = element_text(angle = 90), axis.title = element_text(size = 10, hjust = 0.5), 
+                        plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, 
+                                                                                           hjust = 0.5)) 
+
+germany_covid %>% ggplot(aes(x = date, y = deaths)) + geom_point() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + labs(x = "Date", y = "Death number (logarithmic)", title = "COVID-19 death data over time in Germany 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) + scale_y_log10() +
+                    geom_vline(xintercept = as.Date("2020-03-22", "%Y-%m-%d"), color = "yellow") +
+  geom_vline(xintercept = as.Date("2020-11-02", "%Y-%m-%d"), color = "orange") +
+  geom_vline(xintercept = as.Date("2020-12-16", "%Y-%m-%d"), color = "purple") +
+  geom_vline(xintercept = as.Date("2021-04-23", "%Y-%m-%d"), color = "red") +
+  geom_vline(xintercept = as.Date("2021-08-23", "%Y-%m-%d"), color = "navy") +
+    geom_vline(xintercept = as.Date("2022-03-19", "%Y-%m-%d"), color = "blue") +
+    geom_vline(xintercept = as.Date("2022-00-16", "%Y-%m-%d"), color = "green") 
+
+```
+
+**Research Question 2: Relation between cases and deaths**
+
+```{r message=FALSE, warning=FALSE}
+
+ggplot(germany_covid, aes(x = date)) +
+  geom_point(aes(y = case_rate), color = "blue") +
+  geom_line(aes(y = case_rate), color = "blue") +
+  
+  geom_point(aes(y = death_rate * max(case_rate) / max(death_rate)), color = "red") +
+  geom_line(aes(y = death_rate* max(case_rate) / max(death_rate)), color = "red") +
+  
+  scale_y_continuous(
+    name = "Case Rate per 100,000",
+    sec.axis = sec_axis(~./(max(germany_covid$case_rate) / max(germany_covid$death_rate)), name = "Death Rate per 100,000")
+  ) +
+  theme_bw() +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b%y")+
+  theme(axis.text.x = element_text(angle = 90),
+        axis.title = element_text(size = 10, hjust = 0.5),
+        plot.title = element_text(size = 12, hjust = 0.5),
+        plot.subtitle = element_text(size = 10, hjust = 0.5)) +
+  labs(x = "Date",
+       y = "Rate per 100,000",
+       title = "Relation of COVID-19 case and death data over time in Germany 2020-2023",
+       color = "Legend",
+       subtitle = "Cases in blue, Deaths in red")
+
+```
+
+**Research Question 3: Comparing COVID-19 globally**
+
+```{r message=FALSE, warning=FALSE}
+# Data Cleaning and Merging
+
+data_cases = df_cases %>% filter(country == "India") %>% dplyr::select(-c(country)) %>%
+    pivot_longer(
+      everything(),
+      names_to = "date",
+      values_to = "cases"
+    )
+
+data_deaths = df_deaths %>% filter(country == "India") %>% dplyr::select(-c(country)) %>%
+    pivot_longer(
+      everything(),
+      names_to = "date",
+      values_to = "cases"
+    )
+
+data_cases$date = as.Date(data_cases$date, "%m/%d/%y")
+data_deaths$date = as.Date(data_deaths$date, "%m/%d/%y")
+
+india_covid = merge(data_cases, data_deaths, by = "date", all = TRUE)
+
+names(india_covid) = c("date", "cases", "deaths")
+
+# calculating daily cases and deaths
+temp = india_covid$cases[1]
+for (x in 2:nrow(india_covid)) {
+    temp2 = india_covid$cases[x] 
+    india_covid$cases[x] = temp2-temp
+    temp = temp2
+}
+
+temp = india_covid$deaths[1]
+for (x in 2:nrow(india_covid)) {
+    temp2 = india_covid$deaths[x] 
+    india_covid$deaths[x] = temp2-temp
+    temp = temp2
+}
+
+index = which(india_covid$cases!=0)[1]
+first_day = india_covid$date[index]
+india_covid$days_rel_start = julian(india_covid$date,as.Date(first_day,"%m-%d-%y")) # start date of pandemic
+
+# accounting for case outliers and missing reports
+india_covid = india_covid %>%  mutate (cases = ifelse(is.na(cases)|cases<0, 0, cases),
+                                           deaths = ifelse(is.na(deaths)|deaths<0, 0, deaths))
+
+no_reports_cases = which(india_covid$cases == 0)
+
+no_reports_deaths = which(india_covid$deaths == 0)
+
+for (index in no_reports_cases) {
+  if (index >= 4 && index <= (nrow(india_covid) - 3)) {
+    avg_cases = mean(c(india_covid$cases[(index - 3):(index - 1)], india_covid$cases[(index + 1):(index + 3)]))
+    india_covid$cases[index] = as.integer(avg_cases)
+  }
+}
+
+for (index in no_reports_deaths) {
+  if (index >= 4 && index <= (nrow(india_covid) - 3)) {
+    avg_deaths = mean(c(india_covid$deaths[(index - 3):(index - 1)], india_covid$deaths[(index + 1):(index + 3)]))
+    india_covid$deaths[index] = as.integer(avg_deaths)
+  }
+}
+
+# create some more variables
+india_covid$day = day(india_covid$date)
+india_covid$month = month(india_covid$date)
+india_covid$year = year(india_covid$date)
+
+population = 1400000000 
+india_covid$case_rate = 100000*india_covid$cases/population
+india_covid$death_rate = 100000*india_covid$deaths/population
+
+# merge data frames
+germany_covid$country = "Germany"
+india_covid$country = "India"
+
+germany_india_covid = bind_rows(germany_covid, india_covid) %>% arrange(date) %>% select(date, country,everything())
+```
+
+```{r message=FALSE, warning=FALSE}
+
+# plotting absolute case and death data
+
+germany_india_covid %>% ggplot(aes(x = date, y = cases, color = country)) + geom_point() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + scale_y_continuous(labels = comma) + labs(x = "Date", y = "Case number", color = "Country", title = "COVID-19 case number over time in Germany and India 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) 
+
+germany_india_covid %>% ggplot(aes(x = date, y = deaths, color = country)) + geom_point() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + scale_y_continuous(labels = comma) + labs(x = "Date", y = "Death number", color = "Country", title = "COVID-19 death number over time in Germany and India 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) 
+
+```
+
+```{r message=FALSE, warning=FALSE}
+
+# show case and death rate per 100,000
+
+germany_india_covid %>% ggplot(aes(x = date, y = case_rate, color = country)) + geom_point() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + scale_y_continuous(labels = comma) + labs(x = "Date", y = "Case rate per 100,000", color = "Country", title = "COVID-19 case rate over time in Germany and India 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) 
+
+germany_india_covid %>% ggplot(aes(x = date, y = death_rate, color = country)) + geom_point() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + scale_y_continuous(labels = comma) + labs(x = "Date", y = "Death rate per 100,000", color = "Country", title = "COVID-19 death rate over time in Germany and India 2020-2023") + theme_bw() + theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = element_text(size = 10, hjust = 0.5)) 
+
+```
+**Research Question 4: Predicting COVID-19 cases**
+
+```{r message=FALSE, warning=FALSE}
+# https://facebook.github.io/prophet/docs/quick_start.html#r-api
+
+# mutate data to fit format prescribed in prophet documentation
+germany_cases_prophet = germany_covid %>% rename(ds = date, y = cases) %>% select(ds, y) %>% filter(ds >= "2020-07-01" & ds < "2021-07-01")
+m = prophet(yearly.seasonality=5)
+m = add_seasonality(m, name='weekly', period=7, fourier.order=20)
+
+m = fit.prophet(m, germany_cases_prophet)
+
+future = make_future_dataframe(m, periods = 365)
+tail(future)
+
+forecast = predict(m, future)
+plot(m, forecast) + add_changepoints_to_plot(m)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+# https://facebook.github.io/prophet/docs/quick_start.html#r-api
+
+# mutate data to fit format prescribed in prophet documentation
+
+germany_deaths_prophet = germany_covid %>% rename(ds = date, y = deaths) %>% select(ds, y) %>% filter(ds >= "2020-07-01" & ds < "2021-07-01")
+m = prophet(yearly.seasonality=20) #changepoint.prior.scale = 0.5
+m = add_seasonality(m, name='weekly', period=7, fourier.order=10)
+
+m = fit.prophet(m, germany_deaths_prophet)
+
+future = make_future_dataframe(m, periods = 365)
+tail(future)
+
+forecast = predict(m, future)
+#tail(forecast[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')])
+plot(m, forecast) + add_changepoints_to_plot(m)
+
+prophet_plot_components(m, forecast)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+
+# plot comparison between forecast and actual death data for July 2021 - July 2022
+
+germany_cases_test = germany_covid %>% filter(date >= "2021-07-01" & date < "2022-07-01")
+forecast_test = forecast %>% filter(ds >= "2021-07-01" & ds < "2022-07-01") %>% mutate(date = as.Date(ds))
+
+comparison = merge(germany_cases_test %>% select(c(date,deaths)), forecast_test %>% select(c(date,yhat)), by= "date")
+
+ggplot(comparison, aes(x = date, y= deaths), type = "l", 
+     ylim = c(0, max(comparison$deaths, comparison$yhat_upper)),
+     main = "Actual vs Forecasted COVID deaths in Germany (2022)") +
+  labs(x = "Time", y = "Deaths", title = "Prediction of COVID-19 deaths in Germany (July 2021 - July 2022)", subtitle = "Real data: red, Prediction based on previous 12 months: blue")+ geom_point(col = "red") + geom_line(color = "red") + geom_smooth(color = "red") +
+  geom_point(aes(date, yhat), col = "blue") + geom_line(aes(date, yhat),color = "blue") + geom_smooth(aes(date, yhat), color = "blue") +  
+  theme(axis.title = element_text(size = 10, hjust = 0.5), plot.title = element_text(size = 12, hjust = 0.5), plot.subtitle = 
+          element_text(size = 10, hjust = 0.5)) 
+
+```
+
